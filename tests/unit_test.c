@@ -13,7 +13,7 @@
  * See the GNU General Public License for more details.
  *
  * Alternatively, you can license this library under a commercial
- * license, as set out in <http://cesanta.com/products.html>.
+ * license, as set out in <https://www.cesanta.com/license>.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -60,8 +60,12 @@ extern long timezone;
 #define isnan(x) _isnan(x)
 #endif
 
+static enum v7_err eval(struct v7 *v7, v7_val_t *result, const char *code) {
+  return v7_exec(v7, code, result);
+}
+
 static enum v7_err parse_js(struct v7 *v7, const char *src, struct ast *a) {
-  enum v7_err parse_result = parse(v7, a, src, 1 /* verbose */);
+  enum v7_err parse_result = parse(v7, a, src, 1 /* verbose */, 0);
   if (parse_result != V7_OK) {
     fprintf(stderr, "Parse error. Expression:\n  %s\nMessage:\n  %s\n", src,
             v7->error_msg);
@@ -85,11 +89,55 @@ static int check_value(struct v7 *v7, val_t v, const char *str) {
   return res;
 }
 
+static int check_js_expr(struct v7 *v7, val_t v_actual,
+                         const char *expect_js_expr) {
+  int res = 1;
+  v7_val_t v_expect;
+  enum v7_err e;
+
+  v7_own(v7, &v_actual);
+
+  /* execute expected value */
+  e = v7_exec(v7, expect_js_expr, &v_expect);
+  v7_own(v7, &v_expect);
+
+  if (e != V7_OK) {
+    /* failed to execute expected value */
+    printf("Exec expected '%s' failed, err=%d\n", expect_js_expr, e);
+    res = 0;
+  } else {
+    /* now, stringify both values (actual and expected) and compare them */
+
+    char buf_actual[2048];
+    char *p_actual = v7_to_json(v7, v_actual, buf_actual, sizeof(buf_actual));
+
+    char buf_expect[2048];
+    char *p_expect = v7_to_json(v7, v_expect, buf_expect, sizeof(buf_expect));
+
+    if (strcmp(p_actual, p_expect) != 0) {
+      _strfail(p_actual, p_expect, -1);
+      res = 0;
+    }
+    if (p_actual != buf_actual) {
+      free(p_actual);
+    }
+
+    if (p_expect != buf_expect) {
+      free(p_expect);
+    }
+  }
+
+  v7_disown(v7, &v_expect);
+  v7_disown(v7, &v_actual);
+
+  return res;
+}
+
 static int check_num(struct v7 *v7, val_t v, double num) {
   int ret = isnan(num) ? isnan(v7_to_number(v)) : v7_to_number(v) == num;
   (void) v7;
   if (!ret) {
-    printf("Num: want %lf got %lf\n", num, v7_to_number(v));
+    printf("Num: want %f got %f\n", num, v7_to_number(v));
   }
 
   return ret;
@@ -112,7 +160,7 @@ static int check_str(struct v7 *v7, val_t v, const char *expected) {
 
 static int test_if_expr(struct v7 *v7, const char *expr, int result) {
   val_t v;
-  if (v7_exec(v7, &v, expr) != V7_OK) return 0;
+  if (v7_exec(v7, expr, &v) != V7_OK) return 0;
   return result == (v7_is_true(v7, v) ? 1 : 0);
 }
 
@@ -121,33 +169,38 @@ static int test_if_expr(struct v7 *v7, const char *expr, int result) {
     v7_val_t v;                                         \
     enum v7_err e;                                      \
     num_tests++;                                        \
-    e = v7_exec(v7, &v, js_expr);                       \
+    e = v7_exec(v7, js_expr, &v);                       \
     if (e != V7_OK) {                                   \
       printf("Exec '%s' failed, err=%d\n", js_expr, e); \
       FAIL("ASSERT_EVAL_OK(" #js_expr ")", __LINE__);   \
     }                                                   \
   } while (0)
 
-#define _ASSERT_EVAL_EQ(v7, js_expr, expected, check_fun)            \
-  do {                                                               \
-    v7_val_t v;                                                      \
-    enum v7_err e;                                                   \
-    int r = 1;                                                       \
-    num_tests++;                                                     \
-    e = v7_exec(v7, &v, js_expr);                                    \
-    if (e != V7_OK) {                                                \
-      printf("Exec '%s' failed, err=%d\n", js_expr, e);              \
-      r = 0;                                                         \
-    } else {                                                         \
-      r = check_fun(v7, v, expected);                                \
-    }                                                                \
-    if (r == 0) {                                                    \
-      FAIL("ASSERT_EVAL_EQ(" #js_expr ", " #expected ")", __LINE__); \
-    }                                                                \
+#define _ASSERT_XXX_EVAL_EQ(v7, js_expr, expected, check_fun, eval_fun) \
+  do {                                                                  \
+    v7_val_t v;                                                         \
+    enum v7_err e;                                                      \
+    int r = 1;                                                          \
+    num_tests++;                                                        \
+    e = eval_fun(v7, js_expr, &v);                                      \
+    if (e != V7_OK) {                                                   \
+      printf("Exec '%s' failed, err=%d\n", js_expr, e);                 \
+      r = 0;                                                            \
+    } else {                                                            \
+      r = check_fun(v7, v, expected);                                   \
+    }                                                                   \
+    if (r == 0) {                                                       \
+      FAIL("ASSERT_EVAL_EQ(" #js_expr ", " #expected ")", __LINE__);    \
+    }                                                                   \
   } while (0)
+
+#define _ASSERT_EVAL_EQ(v7, js_expr, expected, check_fun) \
+  _ASSERT_XXX_EVAL_EQ(v7, js_expr, expected, check_fun, v7_exec)
 
 #define ASSERT_EVAL_EQ(v7, js_expr, expected) \
   _ASSERT_EVAL_EQ(v7, js_expr, expected, check_value)
+#define ASSERT_EVAL_JS_EXPR_EQ(v7, js_expr, expected) \
+  _ASSERT_EVAL_EQ(v7, js_expr, expected, check_js_expr)
 #define ASSERT_EVAL_NUM_EQ(v7, js_expr, expected) \
   _ASSERT_EVAL_EQ(v7, js_expr, expected, check_num)
 #define ASSERT_EVAL_STR_EQ(v7, js_expr, expected) \
@@ -197,13 +250,12 @@ static const char *test_closure(void) {
   return NULL;
 }
 
-static val_t adder(struct v7 *v7, val_t this_obj, val_t args) {
+static val_t adder(struct v7 *v7) {
   double sum = 0;
   unsigned long i;
 
-  (void) this_obj;
-  for (i = 0; i < v7_array_length(v7, args); i++) {
-    sum += v7_to_number(v7_array_get(v7, args, i));
+  for (i = 0; i < v7_argc(v7); i++) {
+    sum += v7_to_number(v7_arg(v7, i));
   }
   return v7_create_number(sum);
 }
@@ -211,7 +263,7 @@ static val_t adder(struct v7 *v7, val_t this_obj, val_t args) {
 static const char *test_native_functions(void) {
   struct v7 *v7 = v7_create();
 
-  ASSERT_EQ(v7_set_property(v7, v7_get_global_object(v7), "adder", 5, 0,
+  ASSERT_EQ(v7_set_property(v7, v7_get_global(v7), "adder", 5, 0,
                             v7_create_cfunction(adder)),
             0);
   ASSERT_EVAL_EQ(v7, "adder(1, 2, 3 + 4);", "10");
@@ -221,8 +273,11 @@ static const char *test_native_functions(void) {
 }
 
 static const char *test_stdlib(void) {
-  v7_val_t v;
+  v7_val_t v = v7_create_undefined();
   struct v7 *v7 = v7_create();
+  const char *c;
+
+  v7_own(v7, &v);
 
   ASSERT_EVAL_EQ(v7, "Boolean()", "false");
   ASSERT_EVAL_EQ(v7, "Boolean(0)", "false");
@@ -236,11 +291,11 @@ static const char *test_stdlib(void) {
   /* Number */
   ASSERT_EVAL_NUM_EQ(v7, "Math.PI", M_PI);
   ASSERT_EVAL_NUM_EQ(v7, "Number.NaN", NAN);
-  ASSERT_EQ(v7_exec(v7, &v, "1 == 2"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "1 == 2"), V7_OK);
   ASSERT(check_bool(v, 0));
-  ASSERT_EQ(v7_exec(v7, &v, "1 + 2 * 7 === 15"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "1 + 2 * 7 === 15"), V7_OK);
   ASSERT(check_bool(v, 1));
-  ASSERT_EQ(v7_exec(v7, &v, "Number(1.23) === 1.23"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "Number(1.23) === 1.23"), V7_OK);
   ASSERT(check_bool(v, 1));
   ASSERT_EVAL_NUM_EQ(v7, "Number(1.23)", 1.23);
   ASSERT_EVAL_OK(v7, "new Number(21.23)");
@@ -267,6 +322,51 @@ static const char *test_stdlib(void) {
   ASSERT_EVAL_NUM_EQ(v7, "'hi there'.indexOf('e', 8)", -1.0);
   ASSERT_EVAL_NUM_EQ(v7, "'aabb'.indexOf('a', false)", 0.0);
   ASSERT_EVAL_NUM_EQ(v7, "'aabb'.indexOf('a', true)", 1.0);
+
+  ASSERT_EVAL_NUM_EQ(v7, "'1234д6 1234д6'.indexOf('34д')", 2.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'1234д6 1234д6'.indexOf('34д', 2)", 2.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'1234д6 1234д6'.indexOf('34д', 3)", 9.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'1234д6 1234д6'.indexOf('34д', 9)", 9.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'1234д6 1234д6'.indexOf('34д', 10)", -1.0);
+
+  ASSERT_EVAL_NUM_EQ(v7, "'1234д6 1234д6'.lastIndexOf('34д')", 9.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'1234д6 1234д6'.lastIndexOf('34д', 10)", 9.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'1234д6 1234д6'.lastIndexOf('34д', 9)", 9.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'1234д6 1234д6'.lastIndexOf('34д', 8)", 2.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'1234д6 1234д6'.lastIndexOf('34д', 2)", 2.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'1234д6 1234д6'.lastIndexOf('34д', 1)", -1.0);
+
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.indexOf('')", 0.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.indexOf('', 0)", 0.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.indexOf('', -100)", 0.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.indexOf('', 100)", 3.0);
+
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.lastIndexOf('')", 3.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.lastIndexOf('', 0)", 0.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.lastIndexOf('', -100)", 0.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.lastIndexOf('', 100)", 3.0);
+
+  ASSERT_EVAL_NUM_EQ(v7, "''.indexOf('')", 0.0);
+  ASSERT_EVAL_NUM_EQ(v7, "''.indexOf('', 100)", 0.0);
+  ASSERT_EVAL_NUM_EQ(v7, "''.indexOf('', -100)", 0.0);
+
+  ASSERT_EVAL_NUM_EQ(v7, "''.lastIndexOf('')", 0.0);
+  ASSERT_EVAL_NUM_EQ(v7, "''.lastIndexOf('', 100)", 0.0);
+  ASSERT_EVAL_NUM_EQ(v7, "''.lastIndexOf('', -100)", 0.0);
+
+  ASSERT_EVAL_NUM_EQ(v7, "''.indexOf('a')", -1.0);
+  ASSERT_EVAL_NUM_EQ(v7, "''.lastIndexOf('a')", -1.0);
+
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.indexOf('23', 100)", -1.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.indexOf('23', -100)", 1.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.lastIndexOf('23', 100)", 1.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.lastIndexOf('23', -100)", -1.0);
+
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.indexOf('12', 100)", -1.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.indexOf('12', -100)", 0.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.lastIndexOf('12', 100)", 0.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'123'.lastIndexOf('12', -100)", 0.0);
+
   ASSERT_EVAL_STR_EQ(v7, "'hi there'.substr(3, 2)", "th");
   ASSERT_EVAL_STR_EQ(v7, "'hi there'.substring(3, 5)", "th");
   ASSERT_EVAL_STR_EQ(v7, "'hi there'.substr(3)", "there");
@@ -274,33 +374,102 @@ static const char *test_stdlib(void) {
   ASSERT_EVAL_STR_EQ(v7, "'hi there'.substr(NaN)", "hi there");
   ASSERT_EVAL_STR_EQ(v7, "'hi there'.substr(0, 300)", "hi there");
 #if V7_ENABLE__RegExp
-  ASSERT_EQ(v7_exec(v7, &v, "'dew dee'.match(/\\d+/)"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "'dew dee'.match(/\\d+/)"), V7_OK);
   ASSERT_EQ(v, v7_create_null());
   ASSERT_EVAL_OK(v7, "m = 'foo 1234 bar'.match(/\\S+ (\\d+)/)");
   ASSERT_EVAL_NUM_EQ(v7, "m.length", 2.0);
   ASSERT_EVAL_STR_EQ(v7, "m[0]", "foo 1234");
   ASSERT_EVAL_STR_EQ(v7, "m[1]", "1234");
-  ASSERT_EQ(v7_exec(v7, &v, "m[2]"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "m[2]"), V7_OK);
   ASSERT(v7_is_undefined(v));
   ASSERT_EVAL_OK(v7, "m = 'should match empty string at index 0'.match(/x*/)");
   ASSERT_EVAL_NUM_EQ(v7, "m.length", 1.0);
   ASSERT_EVAL_STR_EQ(v7, "m[0]", "");
-  ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(); m.length", 1.0);
-  ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(''); m.length", 8.0);
   ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(RegExp('')); m.length", 8.0);
   ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(/x*/); m.length", 8.0);
-  ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(/(x)*/); m.length", 16.0);
+  ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(/(x)*/); m.length", 15.0);
   ASSERT_EVAL_STR_EQ(v7, "m[0]", "a");
-  ASSERT_EQ(v7_exec(v7, &v, "m[1]"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "m[1]"), V7_OK);
   ASSERT(v7_is_undefined(v));
-  ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(' '); m.length", 3.0);
-  ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(' ', 2); m.length", 2.0);
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('.'));", "['','','','']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp(''));", "['1','2','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('1'));", "['','23']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('2'));", "['1','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('3'));", "['12','']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('1*'));", "['','2','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('3*'));", "['1','2','']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('2*'));", "['1','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('4*'));", "['1','2','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('2*'), 1);", "['1']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('2*'), 2);", "['1','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('2*'), 3);", "['1','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('2*'), 4);", "['1','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('4*'), 1);", "['1']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('4*'), 2);", "['1','2']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('4*'), 3);", "['1','2','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(RegExp('4*'), 4);", "['1','2','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split(/.*/);", "['', '']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'1234'.split(/.*/);", "['', '']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'12345'.split(/.*/);", "['', '']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123456'.split(/.*/);", "['', '']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "''.split(RegExp(''));", "[]");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "''.split(RegExp('.'));", "['']");
+  ASSERT_EVAL_JS_EXPR_EQ(
+      v7, "'1234'.split(/(x)*/);",
+      "['1', undefined, '2', undefined, '3', undefined, '4']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'1234'.split(/(2)*/);",
+                         "['1', '2', '3', undefined, '4']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'1234'.split(/(\\d)/);",
+                         "['', '1', '', '2', '', '3', '', '4', '']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'1234'.split(/(\\d)*/);", "['', '4', '']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'ab12 cd34'.split(/([a-z]*)(\\d*)/);",
+                         "['', 'ab', '12', ' ', 'cd', '34', '']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'1234'.split(/(x)*/, 0);", "[]");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'1234'.split(/(x)*/, 1);", "['1']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'1234'.split(/(x)*/, 2);", "['1', undefined]");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'1234'.split(/(x)*/, 3);",
+                         "['1', undefined, '2']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'1234'.split(/(x)*/, 4);",
+                         "['1', undefined, '2', undefined]");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'1234'.split(/(x)*/, 5);",
+                         "['1', undefined, '2', undefined, '3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'1234'.split(/(x)*/, 6);",
+                         "['1', undefined, '2', undefined, '3', undefined]");
+  ASSERT_EVAL_JS_EXPR_EQ(
+      v7, "'1234'.split(/(x)*/, 7);",
+      "['1', undefined, '2', undefined, '3', undefined, '4']");
+  ASSERT_EVAL_JS_EXPR_EQ(
+      v7, "'1234'.split(/(x)*/, 8);",
+      "['1', undefined, '2', undefined, '3', undefined, '4']");
   ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(/ /, 2); m.length", 2.0);
-  ASSERT_EVAL_NUM_EQ(v7, "'aa bb cc'.substr(0, 4).split(' ').length", 2.0);
-  ASSERT_EVAL_STR_EQ(v7, "'aa bb cc'.substr(0, 4).split(' ')[1]", "b");
   ASSERT_EVAL_NUM_EQ(
       v7, "({z: '123456'}).z.toString().substr(0, 3).split('').length", 3.0);
+  c = "\"a\\nb\".replace(/\\n/g, \"\\\\\");";
+  ASSERT_EVAL_STR_EQ(v7, c, "a\\b");
+  c = "\"\"";
+  ASSERT_EVAL_EQ(v7, "'abc'.replace(/.+/, '')", c);
 #endif /* V7_ENABLE__RegExp */
+
+  ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(); m.length", 1.0);
+  ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(''); m.length", 8.0);
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split('1');", "['','23']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split('2');", "['1','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split('3');", "['12','']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split('12');", "['','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split('23');", "['1','']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split('123');", "['','']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split('1234');", "['123']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'123'.split('');", "['1','2','3']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'111'.split('1');", "['','','','']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'абв'.split('б');", "['а','в']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'абв'.split('');", "['а','б','в']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'rбв'.split('');", "['r','б','в']");
+  ASSERT_EVAL_JS_EXPR_EQ(v7, "'12.34.56'.split('.');", "['12','34','56']");
+  ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(' '); m.length", 3.0);
+  ASSERT_EVAL_NUM_EQ(v7, "m = 'aa bb cc'.split(' ', 2); m.length", 2.0);
+  ASSERT_EVAL_NUM_EQ(v7, "'aa bb cc'.substr(0, 4).split(' ').length", 2.0);
+  ASSERT_EVAL_STR_EQ(v7, "'aa bb cc'.substr(0, 4).split(' ')[1]", "b");
+
   ASSERT_EVAL_STR_EQ(v7, "String('hi')", "hi");
   ASSERT_EVAL_OK(v7, "new String('blah')");
   ASSERT_EVAL_NUM_EQ(v7, "(String.fromCharCode(0,1) + '\\x00\\x01').length", 4);
@@ -374,6 +543,8 @@ static const char *test_runtime(void) {
 
   v = v7_create_null();
   ASSERT(v7_is_null(v));
+
+  v7_own(v7, &v);
 
   v = v7_create_undefined();
   ASSERT(v7_is_undefined(v));
@@ -491,6 +662,58 @@ static const char *test_runtime(void) {
     v7_create_string(v7, s, 8, 1);
   }
 
+  v = v7_create_array(v7);
+  ASSERT(v7_is_instanceof_v(v7, v, v7_get(v7, v7->global_object, "Array", ~0)));
+  ASSERT(v7_is_instanceof(v7, v, "Array"));
+
+  v = v7_create_number(42);
+  ASSERT(!v7_is_instanceof(v7, v, "Object"));
+  ASSERT(!v7_is_instanceof(v7, v, "Number"));
+
+  v = v7_create_string(v7, "fooakbar", 8, 1);
+  ASSERT(!v7_is_instanceof(v7, v, "Object"));
+  ASSERT(!v7_is_instanceof(v7, v, "String"));
+
+  v7_destroy(v7);
+  return NULL;
+}
+
+static const char *test_apply(void) {
+  struct v7 *v7 = v7_create();
+  val_t v = v7_create_undefined(), fn = v7_create_undefined(),
+        args = v7_create_undefined();
+  v7_own(v7, &v);
+  v7_own(v7, &fn);
+  v7_own(v7, &args);
+
+  fn = v7_get(v7, v7->global_object, "test0", 5); /* no such function */
+  ASSERT_EQ(v7_apply(v7, &v, fn, v7->global_object, v7_create_undefined()),
+            V7_EXEC_EXCEPTION);
+
+  ASSERT_EQ(eval(v7, &v, "function test1(){return 1}"), V7_OK);
+  fn = v7_get(v7, v7->global_object, "test1", 5);
+  ASSERT_EQ(v7_apply(v7, &v, fn, v7->global_object, v7_create_undefined()),
+            V7_OK);
+  ASSERT(check_num(v7, v, 1));
+
+  ASSERT_EQ(v7_apply(v7, NULL, fn, v7->global_object, v7_create_undefined()),
+            V7_OK);
+
+  ASSERT_EQ(eval(v7, &v, "function test2(){throw 2}"), V7_OK);
+  fn = v7_get(v7, v7->global_object, "test2", 5);
+  ASSERT_EQ(v7_apply(v7, &v, fn, v7->global_object, v7_create_undefined()),
+            V7_EXEC_EXCEPTION);
+  ASSERT(check_num(v7, v, 2));
+
+  ASSERT_EQ(eval(v7, &v, "function test1(){return arguments}"), V7_OK);
+  fn = v7_get(v7, v7->global_object, "test1", 5);
+  args = v7_create_array(v7);
+  v7_array_push(v7, args, v7_create_number(1));
+  v7_array_push(v7, args, v7_create_number(2));
+  v7_array_push(v7, args, v7_create_number(3));
+  ASSERT_EQ(v7_apply(v7, &v, fn, v7->global_object, args), V7_OK);
+  ASSERT(v7_array_length(v7, v) == 3);
+
   v7_destroy(v7);
   return NULL;
 }
@@ -530,6 +753,14 @@ static const char *test_dense_arrays(void) {
   ASSERT_EVAL_EQ(v7, "a=mka(1,2,3);a.slice(1,3)", "[2,3]");
 
   ASSERT_EVAL_NUM_EQ(v7, "a=mka(1,2,3);a.indexOf(3)", 2);
+
+  ASSERT_EVAL_NUM_EQ(v7, "(function(){return arguments})(1,2,3).length", 3);
+  ASSERT_EVAL_NUM_EQ(
+      v7, "(function(){return arguments}).apply(this, [1,2,3]).length", 3);
+
+  /* ensure that a zero length dense arrays is correctly recognized */
+  a = v7_create_dense_array(v7);
+  ASSERT(v7_next_prop(v7, a, NULL) == NULL);
 
   v7_destroy(v7);
   return NULL;
@@ -725,6 +956,7 @@ static const char *test_parser(void) {
     "!function(){function d(){}var x}();",
     "({get a() { function d(){} return 1 }})",
     "({set a(v) { function d(a){} d(v) }})",
+    "({a:1, b() { return 2 }, c(d) {}})",
     "{function d(){}var x}",
     "try{function d(){}var x}catch(e){function d(){}var x}finally{function "
     "d(){}var x}",
@@ -748,7 +980,7 @@ static const char *test_parser(void) {
       "break", "break loop", "continue", "continue loop", "return",
       "return 1+2", "if (1) {return;}", "if (1) {return 2}", "({g x() {}})'",
       "({s x() {}})'", "(function(){'use strict'; with({}){}})", "v = [",
-      "var v = ["};
+      "var v = [", "\n1a"};
   FILE *fp;
   const char *want_ast_db = "want_ast.db";
   char got_ast[102400];
@@ -770,6 +1002,7 @@ static const char *test_parser(void) {
 
   for (i = 0; i < (int) ARRAY_SIZE(cases); i++) {
     char *current_want_ast = next_want_ast;
+    ast_free(&a);
     ASSERT((next_want_ast = strchr(current_want_ast, '\0') + 1) != NULL);
     if (cases[i][0] == '\0') continue;
     want_ast_len = (size_t)(next_want_ast - current_want_ast - 1);
@@ -826,7 +1059,7 @@ static const char *test_parser(void) {
 #if 0
     printf("-- Parsing \"%s\"\n", invalid[i]);
 #endif
-    ASSERT_EQ(parse(v7, &a, invalid[i], 0), V7_SYNTAX_ERROR);
+    ASSERT_EQ(parse(v7, &a, invalid[i], 0, 0), V7_SYNTAX_ERROR);
   }
 
   ast_free(&a);
@@ -850,6 +1083,17 @@ static char *read_file(const char *path, size_t *size) {
     fclose(fp);
   }
   return data;
+}
+
+static const char *test_parser_large_ast(void) {
+  struct ast a;
+  struct v7 *v7 = v7_create();
+  size_t script_len;
+  char *script = read_file("large_ast.js", &script_len);
+
+  ast_init(&a, 0);
+  ASSERT_EQ(parse(v7, &a, script, 0, 0), V7_AST_TOO_LARGE);
+  return NULL;
 }
 
 static const char *test_ecmac(void) {
@@ -921,10 +1165,10 @@ static const char *test_ecmac(void) {
     ASSERT_EQ(parse_js(v7, current_case, &a), V7_OK);
     ast_free(&a);
 
-    if (v7_exec(v7, &res, driver) != V7_OK) {
+    if (eval(v7, &res, driver) != V7_OK) {
       fprintf(stderr, "%s: %s\n", "Cannot load ECMA driver", v7->error_msg);
     } else {
-      if (v7_exec(v7, &res, current_case) != V7_OK) {
+      if (eval(v7, &res, current_case) != V7_OK) {
         char buf[2048], *err_str = v7_to_json(v7, res, buf, sizeof(buf));
         fprintf(r, "%i\tFAIL %s: [%s]\n", i, tail_cmd, err_str);
         if (err_str != buf) {
@@ -943,7 +1187,7 @@ static const char *test_ecmac(void) {
            execution_time / (double) CLOCKS_PER_SEC, i, tail_cmd);
 #endif
   }
-  printf("ECMA tests coverage: %.2lf%% (%d of %d)\n",
+  printf("ECMA tests coverage: %.2f%% (%d of %d)\n",
          (double) passed / i * 100.0, passed, i);
 
   free(db);
@@ -1051,7 +1295,7 @@ static const char *test_interpreter(void) {
 
   ASSERT_EVAL_EQ(v7, "+'1'", "1");
   ASSERT_EVAL_EQ(v7, "-'-1'", "1");
-  ASSERT_EQ(v7_exec(v7, &v, "v=[10+1,20*2,30/3]"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "v=[10+1,20*2,30/3]"), V7_OK);
   ASSERT_EQ(val_type(v7, v), V7_TYPE_ARRAY_OBJECT);
   ASSERT_EQ(v7_array_length(v7, v), 3);
   ASSERT(check_value(v7, v, "[11,40,10]"));
@@ -1059,11 +1303,11 @@ static const char *test_interpreter(void) {
   ASSERT_EVAL_EQ(v7, "v[1]", "40");
   ASSERT_EVAL_EQ(v7, "v[2]", "10");
 
-  ASSERT_EQ(v7_exec(v7, &v, "v=[10+1,undefined,30/3]"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "v=[10+1,undefined,30/3]"), V7_OK);
   ASSERT_EQ(v7_array_length(v7, v), 3);
   ASSERT(check_value(v7, v, "[11,undefined,10]"));
 
-  ASSERT_EQ(v7_exec(v7, &v, "v=[10+1,,30/3]"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "v=[10+1,,30/3]"), V7_OK);
   ASSERT_EQ(v7_array_length(v7, v), 3);
   ASSERT(check_value(v7, v, "[11,,10]"));
 
@@ -1075,7 +1319,7 @@ static const char *test_interpreter(void) {
   ASSERT_EVAL_EQ(v7, "x=42; x", "42");
   ASSERT_EVAL_EQ(v7, "x=y=42; x+y", "84");
 
-  ASSERT_EQ(v7_exec(v7, &v, "o={a: 1, b: 2}"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "o={a: 1, b: 2}"), V7_OK);
   ASSERT_EVAL_EQ(v7, "o['a'] + o['b']", "3");
 
   ASSERT_EVAL_EQ(v7, "o.a + o.b", "3");
@@ -1163,8 +1407,8 @@ static const char *test_interpreter(void) {
   ASSERT_EVAL_EQ(v7, "(function(){i=0;do{if(i==5)return i}while(++i)})()", "5");
 
   ASSERT_EQ(
-      v7_exec(v7, &v,
-              "(function(x,y){return x+y})(40,2,(function(){return fail})())"),
+      eval(v7, &v,
+           "(function(x,y){return x+y})(40,2,(function(){return fail})())"),
       V7_EXEC_EXCEPTION);
 
   ASSERT_EVAL_EQ(v7, "x=42; (function(){return x})()", "42");
@@ -1177,6 +1421,18 @@ static const char *test_interpreter(void) {
   ASSERT_EVAL_EQ(v7, "x=42;o={x:66,f:function(){return this}};(1,o.f)().x",
                  "42");
   ASSERT_EVAL_EQ(v7, "x=66;o={x:42,f:function(){return this.x}};o.f()", "42");
+
+  ASSERT_EVAL_NUM_EQ(
+      v7,
+      "x=0; function foo() { x++; return {bar: function() {}}}; foo().bar(); "
+      "x;",
+      1);
+
+  ASSERT_EVAL_NUM_EQ(
+      v7,
+      "x=0; function foo() { x++; return [0,function() {}]}; foo()[0+1](); "
+      "x;",
+      1);
 
   ASSERT_EVAL_EQ(v7, "o={};o.x=24", "24");
   ASSERT_EVAL_EQ(v7, "o.a={};o.a.b={c:66};o.a.b.c", "66");
@@ -1204,6 +1460,10 @@ static const char *test_interpreter(void) {
   ASSERT_EVAL_EQ(v7, "o={x:1};o.x++", "1");
   ASSERT_EVAL_EQ(v7, "o.x", "2");
 
+  c = "\"undefined\"";
+  ASSERT_EVAL_EQ(v7, "x=undefined; typeof x", c);
+  c = "\"undefined\"";
+  ASSERT_EVAL_EQ(v7, "typeof undefined", c);
   c = "\"undefined\"";
   ASSERT_EVAL_EQ(v7, "typeof dummyx", c);
   c = "\"object\"";
@@ -1245,7 +1505,7 @@ static const char *test_interpreter(void) {
   /* TODO(mkm): fix parser: should not require parenthesis */
   ASSERT_EVAL_EQ(v7, "({}) instanceof Object", "true");
 
-  ASSERT_EQ(v7_exec(v7, &v, ""), V7_OK);
+  ASSERT_EQ(eval(v7, &v, ""), V7_OK);
   ASSERT(v7_is_undefined(v));
 #if 0
   ASSERT_EVAL_EQ(v7, "x=0;a=1;o={a:2};with(o){x=a};x", "2");
@@ -1326,10 +1586,10 @@ static const char *test_interpreter(void) {
   ASSERT_EVAL_EQ(v7, "r=1;for(var i in undefined){r=0};r", "1");
   ASSERT_EVAL_EQ(v7, "r=1;for(var i in 42){r=0};r", "1");
 
-  ASSERT_EQ(v7_exec_with(v7, &v, "this", v7_create_number(42)), V7_OK);
+  ASSERT_EQ(v7_exec_with(v7, "this", v7_create_number(42), &v), V7_OK);
   ASSERT(check_value(v7, v, "42"));
-  ASSERT(v7_exec_with(v7, &v, "a=666;(function(a){return a})(this)",
-                      v7_create_number(42)) == V7_OK);
+  ASSERT(v7_exec_with(v7, "a=666;(function(a){return a})(this)",
+                      v7_create_number(42), &v) == V7_OK);
   ASSERT(check_value(v7, v, "42"));
 
   c = "\"aa bb\"";
@@ -1369,6 +1629,8 @@ static const char *test_interpreter(void) {
                  "O;o.x=42;[g,Object.keys(o)]",
                  "[42,[]]");
 
+  ASSERT_EVAL_EQ(v7, "({foo(x){return x*2}}).foo(21)", "42");
+
   c = "\"42\"";
   ASSERT_EVAL_EQ(v7, "String(new Number(42))", c);
 
@@ -1402,7 +1664,7 @@ static const char *test_interpreter(void) {
   c = "\"\"";
   ASSERT_EVAL_EQ(v7, "'' && {}", c);
 
-  ASSERT_EQ(v7_exec_with(v7, &v, "a=this;a", v7_create_foreign((void *) "foo")),
+  ASSERT_EQ(v7_exec_with(v7, "a=this;a", v7_create_foreign((void *) "foo"), &v),
             V7_OK);
   ASSERT(v7_is_foreign(v));
   ASSERT_EQ(strcmp((char *) v7_to_foreign(v), "foo"), 0);
@@ -1415,11 +1677,17 @@ static const char *test_interpreter(void) {
   ASSERT_EVAL_EQ(v7, "a=[1,2,3];a.slice(2,3)", "[3]");
   ASSERT_EVAL_EQ(v7, "a=[1,2,3];a.slice(1,3)", "[2,3]");
 
+  c = "[\"b\",\"a\"]";
+  ASSERT_EVAL_EQ(v7,
+                 "function foo(){}; foo.prototype={a:1}; f=new foo; f.b=2; "
+                 "r=[];for(p in f) r.push(p); r",
+                 c);
+
   /* here temporarily because test_stdlib has memory violations */
   ASSERT_EVAL_EQ(v7, "a=[2,1];a.sort();a", "[1,2]");
 
   /* check execution failure caused by bad parsing */
-  ASSERT_EQ(v7_exec(v7, &v, "function"), V7_SYNTAX_ERROR);
+  ASSERT_EQ(eval(v7, &v, "function"), V7_SYNTAX_ERROR);
 
   v7_destroy(v7);
   return NULL;
@@ -1446,7 +1714,7 @@ static const char *test_strings(void) {
   ASSERT_EQ(v7->owned_strings.len, off);
   ASSERT_EQ(memcmp(&s, "\x6c\x65\x6e\x67\x74\x00\xf9\xff", sizeof(s)), 0);
 
-  s = v7_create_string(v7, "longer one", 10, 1);
+  s = v7_create_string(v7, "longer one", ~0 /* use strlen */, 1);
   ASSERT(v7->owned_strings.len == off + 12);
   ASSERT_EQ(memcmp(v7->owned_strings.buf + off, "\x0alonger one\x00", 12), 0);
 
@@ -1467,11 +1735,11 @@ static const char *test_interp_unescape(void) {
   struct v7 *v7 = v7_create();
   val_t v;
 
-  ASSERT_EQ(v7_exec(v7, &v, "'1234'"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "'1234'"), V7_OK);
   ASSERT_EQ((v & V7_TAG_MASK), V7_TAG_STRING_I);
-  ASSERT_EQ(v7_exec(v7, &v, "'12345'"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "'12345'"), V7_OK);
   ASSERT_EQ((v & V7_TAG_MASK), V7_TAG_STRING_5);
-  ASSERT_EQ(v7_exec(v7, &v, "'123456'"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "'123456'"), V7_OK);
   ASSERT_EQ((v & V7_TAG_MASK), V7_TAG_STRING_O);
 
   ASSERT_EVAL_NUM_EQ(v7, "'123'.length", 3);
@@ -1490,7 +1758,7 @@ static const char *test_interp_unescape(void) {
   ASSERT_EVAL_NUM_EQ(v7, "'123\\\\\\\\\\\\\\\\'.length", 7);
   ASSERT_EVAL_NUM_EQ(v7, "'123\\\\\\\\\\\\\\\\\\\\'.length", 8);
 
-  ASSERT_EQ(v7_exec(v7, &v, "'1234\\\\\\\\'"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "'1234\\\\\\\\'"), V7_OK);
   ASSERT_EQ((v & V7_TAG_MASK), V7_TAG_STRING_O);
 
   v7_destroy(v7);
@@ -1499,18 +1767,90 @@ static const char *test_interp_unescape(void) {
 
 static const char *test_to_json(void) {
   char buf[10], *p;
+  const char *c;
   struct v7 *v7 = v7_create();
-  val_t v;
+  val_t v = v7_create_undefined();
+  v7_own(v7, &v);
 
-  v7_exec(v7, &v, "123.45");
+  eval(v7, &v, "123.45");
   ASSERT((p = v7_to_json(v7, v, buf, sizeof(buf))) == buf);
   ASSERT_STREQ(p, "123.45");
+
+  eval(v7, &v, "'foo'");
+  ASSERT((p = v7_to_json(v7, v, buf, sizeof(buf))) == buf);
+  c = "\"foo\"";
+  ASSERT_STREQ(p, c);
+
+  eval(v7, &v, "'\"foo\"'");
+  ASSERT((p = v7_to_json(v7, v, buf, sizeof(buf))) == buf);
+  c = "\"\\\"foo\\\"\"";
+  ASSERT_STREQ(p, c);
+
 /* TODO(mkm): fix to_json alloc */
 #if 0
   ASSERT((p = v7_to_json(v7, v, buf, 3)) != buf);
   ASSERT_EQ(strcmp(p, "123.45"), 0);
   free(p);
 #endif
+
+  v7_destroy(v7);
+  return NULL;
+}
+
+static const char *test_json_parse(void) {
+  struct v7 *v7 = v7_create();
+  const char *c1, *c2;
+
+  ASSERT_EVAL_NUM_EQ(v7, "JSON.parse(42)", 42);
+  c1 = "JSON.parse('\"foo\"')";
+  c2 = "\"foo\"";
+  ASSERT_EVAL_EQ(v7, c1, c2);
+  c2 = "\"foo\"";
+  ASSERT_EVAL_EQ(v7, "JSON.parse(JSON.stringify('foo'))", c2);
+  c2 = "{\"foo\":\"bar\"}";
+  ASSERT_EVAL_EQ(v7, "JSON.parse(JSON.stringify({'foo':'bar'}))", c2);
+
+  c1 =
+      "JSON.parse(JSON.stringify('"
+      "foooooooooooooooooooooooooooooooooooooooooooooooo"
+      "ooooooooooooooooooooooooooooooooooooooooooooooooo'))",
+
+  c2 =
+      "\"foooooooooooooooooooooooooooooooooooooooooooooooo"
+      "ooooooooooooooooooooooooooooooooooooooooooooooooo\"";
+
+  /* big string, will cause malloc */
+  ASSERT_EVAL_EQ(v7, c1, c2);
+
+  c2 = "\"{\\\"a\\\":\\\"\\\\n\\\"}\"";
+  ASSERT_EVAL_EQ(v7, "JSON.stringify({a:'\n'})", c2);
+
+  c1 = "\"\\b\"";
+  ASSERT_EVAL_EQ(v7, c1, c1);
+  c1 = "\"\\t\"";
+  ASSERT_EVAL_EQ(v7, c1, c1);
+  c1 = "\"\\n\"";
+  ASSERT_EVAL_EQ(v7, c1, c1);
+  c1 = "\"\\v\"";
+  ASSERT_EVAL_EQ(v7, c1, c1);
+  c1 = "\"\\f\"";
+  ASSERT_EVAL_EQ(v7, c1, c1);
+  c1 = "\"\\r\"";
+  ASSERT_EVAL_EQ(v7, c1, c1);
+  c1 = "\"\\\\\"";
+  ASSERT_EVAL_EQ(v7, c1, c1);
+
+  {
+    val_t res;
+    const char *s;
+    size_t len;
+
+    eval(v7, &res, "JSON.stringify('\"\\n\"')");
+    s = v7_to_string(v7, &res, &len);
+
+    c1 = "\"\\\"\\n\\\"\"";
+    ASSERT_STREQ(s, c1);
+  }
 
   v7_destroy(v7);
   return NULL;
@@ -1538,43 +1878,43 @@ static const char *test_gc_mark(void) {
   struct v7 *v7 = v7_create();
   val_t v;
 
-  v7_exec(v7, &v, "o=({a:{b:1},c:{d:2},e:null});o.e=o;o");
+  eval(v7, &v, "o=({a:{b:1},c:{d:2},e:null});o.e=o;o");
   gc_mark(v7, v);
   ASSERT(MARKED(v7_to_object(v)));
   v7_gc(v7, 0); /* cleanup marks */
   v7_destroy(v7);
   v7 = v7_create();
 
-  v7_exec(v7, &v, "o=({a:{b:1},c:{d:2},e:null});o.e=o;o");
+  eval(v7, &v, "o=({a:{b:1},c:{d:2},e:null});o.e=o;o");
   gc_mark(v7, v7->global_object);
   ASSERT(MARKED(v7_to_object(v)));
   v7_gc(v7, 0); /* cleanup marks */
   v7_destroy(v7);
   v7 = v7_create();
 
-  v7_exec(v7, &v, "function f() {}; o=new f;o");
+  eval(v7, &v, "function f() {}; o=new f;o");
   gc_mark(v7, v);
   ASSERT(MARKED(v7_to_object(v)));
   v7_gc(v7, 0); /* cleanup marks */
   v7_destroy(v7);
   v7 = v7_create();
 
-  v7_exec(v7, &v, "function f() {}; Object.getPrototypeOf(new f)");
+  eval(v7, &v, "function f() {}; Object.getPrototypeOf(new f)");
   gc_mark(v7, v7->global_object);
   ASSERT(MARKED(v7_to_object(v)));
   v7_gc(v7, 0); /* cleanup marks */
   v7_destroy(v7);
   v7 = v7_create();
 
-  v7_exec(v7, &v, "({a:1})");
+  eval(v7, &v, "({a:1})");
   gc_mark(v7, v7->global_object);
   ASSERT(!MARKED(v7_to_object(v)));
   v7_gc(v7, 0); /* cleanup marks */
   v7_destroy(v7);
   v7 = v7_create();
 
-  v7_exec(v7, &v,
-          "var f;(function() {var x={a:1};f=function(){return x};return x})()");
+  eval(v7, &v,
+       "var f;(function() {var x={a:1};f=function(){return x};return x})()");
   gc_mark(v7, v7->global_object);
   /* `x` is reachable through `f`'s closure scope */
   ASSERT(MARKED(v7_to_object(v)));
@@ -1582,8 +1922,8 @@ static const char *test_gc_mark(void) {
   v7_destroy(v7);
   v7 = v7_create();
 
-  v7_exec(v7, &v,
-          "(function() {var x={a:1};var f=function(){return x};return x})()");
+  eval(v7, &v,
+       "(function() {var x={a:1};var f=function(){return x};return x})()");
   gc_mark(v7, v7->global_object);
   /* `f` is unreachable, hence `x` is not marked through the scope */
   ASSERT(!MARKED(v7_to_object(v)));
@@ -1593,6 +1933,7 @@ static const char *test_gc_mark(void) {
   return NULL;
 }
 
+#ifndef V7_MALLOC_GC
 static const char *test_gc_sweep(void) {
   struct v7 *v7 = v7_create();
   val_t v;
@@ -1600,7 +1941,7 @@ static const char *test_gc_sweep(void) {
 
   v7_gc(v7, 0);
   alive = v7->object_arena.alive;
-  v7_exec(v7, &v, "x=({a:1})");
+  eval(v7, &v, "x=({a:1})");
   v7_to_object(v);
   v7_gc(v7, 0);
   ASSERT(v7->object_arena.alive > alive);
@@ -1622,6 +1963,7 @@ static const char *test_gc_sweep(void) {
   v7_destroy(v7);
   return NULL;
 }
+#endif
 
 static const char *test_gc_own(void) {
   struct v7 *v7 = v7_create();
@@ -1664,6 +2006,10 @@ static int check_file(struct v7 *v7, v7_val_t s, const char *file_name) {
   const char *s2 = v7_to_string(v7, &s, &n2);
   int result = n1 == n2 && memcmp(s1, s2, n1) == 0;
   free(s1);
+  if (result == 0) {
+    printf("want '%.*s' (len %d), got '%.*s' (len %d)\n", (int) n2, s2,
+           (int) n2, (int) n1, s1, (int) n1);
+  }
   return result;
 }
 
@@ -1672,19 +2018,22 @@ static const char *test_file(void) {
   struct v7 *v7 = v7_create();
   v7_val_t v, data_str = v7_create_string(v7, data, strlen(data), 1);
 
-  v7_set(v7, v7_get_global_object(v7), "ts", 2, 0, data_str);
-  ASSERT(v7_exec(v7, &v,
-                 "f = File.open('ft.txt', 'w+'); "
-                 " f.write(ts); f.close();") == V7_OK);
+  v7_own(v7, &data_str);
+  v7_set(v7, v7_get_global(v7), "ts", 2, 0, data_str);
+  ASSERT(eval(v7, &v,
+              "f = File.open('ft.txt', 'w+'); "
+              " f.write(ts); f.close();") == V7_OK);
   ASSERT(check_file(v7, data_str, test_file_name));
   ASSERT_EQ(remove(test_file_name), 0);
-  ASSERT_EQ(v7_exec(v7, &v, "f = File.open('test.mk'); f.readAll()"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "f = File.open('test.mk'); f.readAll()"), V7_OK);
   ASSERT(check_file(v7, v, "test.mk"));
-  ASSERT_EQ(v7_exec(v7, &v, "l = File.list('non existent directory')"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "l = File.list('non existent directory')"), V7_OK);
   ASSERT(v7_is_undefined(v));
-  ASSERT_EQ(v7_exec(v7, &v, "l = File.list('.');"), V7_OK);
+  ASSERT_EQ(eval(v7, &v, "l = File.list('.');"), V7_OK);
   ASSERT(v7_is_array(v7, v));
   ASSERT_EVAL_EQ(v7, "l.indexOf('unit_test.c') >= 0", "true");
+
+  v7_disown(v7, &data_str);
   v7_destroy(v7);
   return NULL;
 }
@@ -1728,12 +2077,178 @@ static const char *test_crypto(void) {
 }
 #endif
 
+#ifdef V7_ENABLE_UBJSON
+static const char *test_ubjson(void) {
+  struct v7 *v7 = v7_create();
+  const char *c;
+
+  ASSERT_EVAL_OK(v7, "o = {a:1,b:2}");
+  ASSERT_EVAL_OK(v7, "b='';UBJSON.render(o, function(v) {b+=v},function(){})");
+  c = "{i\001bi\002i\001ai\001}";
+  ASSERT_EVAL_STR_EQ(v7, "b", c);
+
+  ASSERT_EVAL_OK(v7,
+                 "var c, o = {x:new UBJSON.Bin(3,function(){"
+                 "  c=this;this.send('')"
+                 "}),a:1,b:2}");
+  ASSERT_EVAL_OK(v7, "b='';UBJSON.render(o, function(v) {b+=v},function(e){})");
+  c = "{i\001bi\002i\001ai\001i\001x[$U#i\003";
+  ASSERT_EVAL_STR_EQ(v7, "b", c);
+
+  ASSERT_EVAL_OK(v7, "c.send('f')");
+  c = "{i\001bi\002i\001ai\001i\001x[$U#i\003f";
+  ASSERT_EVAL_STR_EQ(v7, "b", c);
+
+  ASSERT_EVAL_OK(v7, "c.send('oo')");
+  c = "{i\001bi\002i\001ai\001i\001x[$U#i\003foo}";
+  ASSERT_EVAL_STR_EQ(v7, "b", c);
+
+  v7_destroy(v7);
+  return NULL;
+}
+#endif
+
 #define MK_OP_PUSH_LIT(n) OP_PUSH_LIT, (enum opcode)(n)
 #define MK_OP_PUSH_VAR_NAME(n) OP_PUSH_VAR_NAME, (enum opcode)(n)
 #define MK_OP_GET_VAR(n) OP_GET_VAR, (enum opcode)(n)
 #define MK_OP_SET_VAR(n) OP_SET_VAR, (enum opcode)(n)
 
 #ifdef V7_ENABLE_BCODE
+
+static int check_ops(struct bcode *bcode, uint8_t *ops, size_t len) {
+  size_t i;
+  if (bcode->ops.len != len) return 0;
+  for (i = 0; i < len; i++) {
+    if (bcode->ops.buf[i] != ops[i]) return 0;
+  }
+  return 1;
+}
+
+#define BEGIN_CHECK_OPS(expr)                         \
+  do {                                                \
+    ASSERT_EQ(parse_js(v7, expr, &a), V7_OK);         \
+    ASSERT_EQ(compile_script(v7, &a, &bcode), V7_OK); \
+    {                                                 \
+    uint8_t o[] =
+
+#define END_CHECK_OPS()                        \
+  ASSERT(check_ops(&bcode, o, ARRAY_SIZE(o))); \
+  }                                            \
+  bcode_free(&bcode);                          \
+  ast_free(&a);                                \
+  }                                            \
+  while (0)
+
+static const char *test_compiler(void) {
+  struct v7 *v7 = v7_create();
+  struct bcode bcode;
+  struct ast a;
+
+  bcode_init(&bcode);
+  ast_init(&a, 0);
+
+  BEGIN_CHECK_OPS("0+1"){OP_PUSH_ZERO, OP_PUSH_ONE, OP_ADD};
+  END_CHECK_OPS();
+
+  BEGIN_CHECK_OPS("-(1)"){OP_PUSH_ONE, OP_NEG};
+  END_CHECK_OPS();
+
+  BEGIN_CHECK_OPS("1+2*3"){OP_PUSH_ONE, OP_PUSH_LIT, 0,     OP_PUSH_LIT,
+                           1,           OP_MUL,      OP_ADD};
+  END_CHECK_OPS();
+
+  BEGIN_CHECK_OPS("x"){OP_GET_VAR, 0};
+  END_CHECK_OPS();
+
+  BEGIN_CHECK_OPS("x=1"){OP_PUSH_ONE, OP_SET_VAR, 0};
+  END_CHECK_OPS();
+
+  BEGIN_CHECK_OPS("a.b"){OP_GET_VAR, 1, OP_PUSH_LIT, 0, OP_GET};
+  END_CHECK_OPS();
+
+  BEGIN_CHECK_OPS("(0+1)[1-0]"){OP_PUSH_ZERO, OP_PUSH_ONE, OP_ADD, OP_PUSH_ONE,
+                                OP_PUSH_ZERO, OP_SUB,      OP_GET};
+  END_CHECK_OPS();
+
+  BEGIN_CHECK_OPS("a['b']"){OP_GET_VAR, 0, OP_PUSH_LIT, 1, OP_GET};
+  END_CHECK_OPS();
+
+  BEGIN_CHECK_OPS("a.b=0"){OP_GET_VAR, 1, OP_PUSH_LIT, 0, OP_PUSH_ZERO, OP_SET};
+  END_CHECK_OPS();
+
+  BEGIN_CHECK_OPS("a.b+=1"){OP_GET_VAR,  1,       OP_PUSH_LIT,
+                            0,           OP_2DUP, OP_GET,
+                            OP_PUSH_ONE, OP_ADD,  OP_SET};
+  END_CHECK_OPS();
+
+  BEGIN_CHECK_OPS("a['b']=0"){OP_GET_VAR, 0, OP_PUSH_LIT, 1, OP_PUSH_ZERO,
+                              OP_SET};
+  END_CHECK_OPS();
+
+  BEGIN_CHECK_OPS("a['b']+=1"){OP_GET_VAR,  0,       OP_PUSH_LIT,
+                               1,           OP_2DUP, OP_GET,
+                               OP_PUSH_ONE, OP_ADD,  OP_SET};
+  END_CHECK_OPS();
+
+  v7_destroy(v7);
+  return NULL;
+}
+
+#define _ASSERT_BCODE_EVAL_EQ(v7, js_expr, expected, check_fun) \
+  _ASSERT_XXX_EVAL_EQ(v7, js_expr, expected, check_fun, v7_exec_bcode)
+
+#define ASSERT_BCODE_EVAL_EQ(v7, js_expr, expected) \
+  _ASSERT_BCODE_EVAL_EQ(v7, js_expr, expected, check_value)
+#define ASSERT_BCODE_EVAL_NUM_EQ(v7, js_expr, expected) \
+  _ASSERT_BCODE_EVAL_EQ(v7, js_expr, expected, check_num)
+#define ASSERT_BCODE_EVAL_STR_EQ(v7, js_expr, expected) \
+  _ASSERT_BCODE_EVAL_EQ(v7, js_expr, expected, check_str)
+
+static const char *test_exec_bcode(void) {
+  struct v7 *v7 = v7_create();
+
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "0+1", 1);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "2+3", 5);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "1+2*3", 7);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "(1+2)*3", 9);
+
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x=42", 42);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x", 42);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "42+42", 84);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x+x", 84);
+
+  ASSERT_EVAL_OK(v7, "x={a:42}");
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x.a", 42);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x['a']", 42);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x.a=0", 0);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x.a", 0);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x.a+=1", 1);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x.a", 1);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x['a']=0", 0);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x['a']", 0);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x['a']+=1", 1);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "x['a']", 1);
+
+  ASSERT_BCODE_EVAL_EQ(v7, "while(0) 1", "undefined");
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "a=1;while(a) a-=1", 0);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "a=3;b=0;while(a) {a-=1;b+=1}", 3);
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "a=3;b=0;while(a) {a-=1;b+=1};b", 3);
+
+  ASSERT_BCODE_EVAL_NUM_EQ(v7, "a=0;b=0;for(i=0;i<10;i+=1) b+=1", 10);
+  ASSERT_BCODE_EVAL_EQ(v7, "for(1;false;1) 1", "undefined");
+  ASSERT_BCODE_EVAL_EQ(v7, "for(1;false;) 1", "undefined");
+
+  v7_destroy(v7);
+  return NULL;
+}
+
+static void _eval_bcode_op(struct v7 *v7, uint8_t op) {
+  struct bcode bcode;
+  bcode_init(&bcode);
+  mbuf_append(&bcode.ops, &op, sizeof(op));
+  eval_bcode(v7, &bcode);
+  bcode_free(&bcode);
+}
 
 static const char *test_bcode(void) {
   struct v7 *v7 = v7_create();
@@ -1762,34 +2277,34 @@ static const char *test_bcode(void) {
   struct bcode bcode;
   val_t y, y_proto;
   char buf[512];
+  val_t lit[7];
 
   v7->call_stack = v7_create_object(v7);
-  v7_to_object(v7->call_stack)->prototype =
-      v7_to_object(v7_get_global_object(v7));
+  v7_to_object(v7->call_stack)->prototype = v7_to_object(v7_get_global(v7));
 
-  v7_set(v7, v7_get_global_object(v7), "x", 1, 0, v7_create_number(666));
+  v7_set(v7, v7_get_global(v7), "x", 1, 0, v7_create_number(666));
   y_proto = v7_create_object(v7);
   y = create_object(v7, y_proto);
   v7_set(v7, y_proto, "b", 1, 0, v7_create_number(10));
   v7_set(v7, y, "a", 1, 0, v7_create_number(20));
   v7_set(v7, v7->call_stack, "y", 1, 0, y);
 #if 0
-  v7_set(v7, v7_get_global_object(v7), "r", 1, 0, v7_create_undefined());
+  v7_set(v7, v7_get_global(v7), "r", 1, 0, v7_create_undefined());
 #endif
-  v7_set(v7, v7_get_global_object(v7), "gy", 2, 0, y);
-  v7_set(v7, v7_get_global_object(v7), "gyp", 3, 0, y_proto);
-  v7_set(v7, v7_get_global_object(v7), "scope", 5, 0, v7->call_stack);
+  v7_set(v7, v7_get_global(v7), "gy", 2, 0, y);
+  v7_set(v7, v7_get_global(v7), "gyp", 3, 0, y_proto);
+  v7_set(v7, v7_get_global(v7), "scope", 5, 0, v7->call_stack);
 
-  memset(&bcode, 0, sizeof(bcode));
-  bcode.ops = ops;
-  bcode.ops_len = ARRAY_SIZE(ops);
-  bcode.lit[0] = v7_create_number(42);
-  bcode.lit[1] = v7_create_string(v7, "x", 1, 1);
-  bcode.lit[2] = v7_create_string(v7, "y", 1, 1);
-  bcode.lit[3] = v7_create_string(v7, "a", 1, 1);
-  bcode.lit[4] = v7_create_string(v7, "b", 1, 1);
-  bcode.lit[5] = v7_create_string(v7, "r", 1, 1);
-  bcode.lit[6] = v7_create_number((42 + 1 - 42 + 666) * 20);
+  bcode_init(&bcode);
+  mbuf_append(&bcode.ops, ops, ARRAY_SIZE(ops));
+  lit[0] = v7_create_number(42);
+  lit[1] = v7_create_string(v7, "x", 1, 1);
+  lit[2] = v7_create_string(v7, "y", 1, 1);
+  lit[3] = v7_create_string(v7, "a", 1, 1);
+  lit[4] = v7_create_string(v7, "b", 1, 1);
+  lit[5] = v7_create_string(v7, "r", 1, 1);
+  lit[6] = v7_create_number((42 + 1 - 42 + 666) * 20);
+  mbuf_append(&bcode.lit, lit, ARRAY_SIZE(ops) * sizeof(val_t));
 
   ASSERT_EQ(v7->sp, 0);
   eval_bcode(v7, &bcode);
@@ -1811,6 +2326,25 @@ static const char *test_bcode(void) {
   ASSERT_EVAL_EQ(v7, "scope.r", "13340");
   ASSERT_EVAL_EQ(v7, "r", "13340");
 
+  bcode_free(&bcode);
+
+  /* test primitive opcodes */
+
+  _eval_bcode_op(v7, OP_PUSH_ZERO);
+  ASSERT(check_num(v7, v7->stack[v7->sp - 1], 0));
+  _eval_bcode_op(v7, OP_DUP);
+  ASSERT(check_num(v7, v7->stack[v7->sp - 1], 0));
+  ASSERT(check_num(v7, v7->stack[v7->sp - 2], 0));
+  _eval_bcode_op(v7, OP_PUSH_ONE);
+  _eval_bcode_op(v7, OP_POP);
+  ASSERT(check_num(v7, v7->stack[v7->sp - 1], 0));
+  _eval_bcode_op(v7, OP_PUSH_ONE);
+  _eval_bcode_op(v7, OP_2DUP);
+  ASSERT(check_num(v7, v7->stack[v7->sp - 1], 1));
+  ASSERT(check_num(v7, v7->stack[v7->sp - 2], 0));
+  ASSERT(check_num(v7, v7->stack[v7->sp - 3], 1));
+  ASSERT(check_num(v7, v7->stack[v7->sp - 4], 0));
+
   v7_destroy(v7);
   return NULL;
 }
@@ -1820,6 +2354,7 @@ static const char *test_bcode(void) {
 static const char *run_all_tests(const char *filter, double *total_elapsed) {
   RUN_TEST(test_unescape);
   RUN_TEST(test_to_json);
+  RUN_TEST(test_json_parse);
   RUN_TEST(test_tokenizer);
   RUN_TEST(test_string_encoding);
   RUN_TEST(test_is_true);
@@ -1827,7 +2362,11 @@ static const char *run_all_tests(const char *filter, double *total_elapsed) {
   RUN_TEST(test_native_functions);
   RUN_TEST(test_stdlib);
   RUN_TEST(test_runtime);
+  RUN_TEST(test_apply);
   RUN_TEST(test_parser);
+#ifndef V7_LARGE_AST
+  RUN_TEST(test_parser_large_ast);
+#endif
   RUN_TEST(test_interpreter);
   RUN_TEST(test_interp_unescape);
   RUN_TEST(test_strings);
@@ -1841,13 +2380,20 @@ static const char *run_all_tests(const char *filter, double *total_elapsed) {
 #ifdef V7_ENABLE_CRYPTO
   RUN_TEST(test_crypto);
 #endif
+#ifdef V7_ENABLE_UBJSON
+  RUN_TEST(test_ubjson);
+#endif
 #ifndef V7_DISABLE_GC
   RUN_TEST(test_gc_mark);
+#ifndef V7_MALLOC_GC
   RUN_TEST(test_gc_sweep);
+#endif
   RUN_TEST(test_gc_own);
 #endif
   RUN_TEST(test_ecmac);
 #ifdef V7_ENABLE_BCODE
+  RUN_TEST(test_compiler);
+  RUN_TEST(test_exec_bcode);
   RUN_TEST(test_bcode);
 #endif
   return NULL;
@@ -1857,7 +2403,7 @@ int main(int argc, char *argv[]) {
   const char *filter = argc > 1 ? argv[1] : "";
   double total_elapsed = 0.0;
   const char *fail_msg = run_all_tests(filter, &total_elapsed);
-  printf("%s, run %d in %.3lfs\n", fail_msg ? "FAIL" : "PASS", num_tests,
+  printf("%s, run %d in %.3fs\n", fail_msg ? "FAIL" : "PASS", num_tests,
          total_elapsed);
   return fail_msg == NULL ? EXIT_SUCCESS : EXIT_FAILURE;
 }
